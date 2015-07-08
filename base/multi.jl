@@ -761,126 +761,33 @@ function accept_handler(server::TCPServer, status::Int32)
     process_messages(client, client)
 end
 
-process_messages(r_stream::TCPSocket, w_stream::TCPSocket) = process_messages(r_stream, w_stream, nothing)
-process_messages(r_stream::TCPSocket, w_stream::TCPSocket, rr_ntfy_join) = @schedule process_tcp_streams(r_stream, w_stream, rr_ntfy_join)
+process_messages(r_stream::TCPSocket, w_stream::TCPSocket) = @schedule process_tcp_streams(r_stream, w_stream)
 
-function process_tcp_streams(r_stream::TCPSocket, w_stream::TCPSocket, rr_ntfy_join)
+function process_tcp_streams(r_stream::TCPSocket, w_stream::TCPSocket)
         disable_nagle(r_stream)
         wait_connected(r_stream)
         if r_stream != w_stream
             disable_nagle(w_stream)
             wait_connected(w_stream)
         end
-        message_handler_loop(r_stream, w_stream, rr_ntfy_join)
+        message_handler_loop(r_stream, w_stream)
 end
 
-process_messages(r_stream::AsyncStream, w_stream::AsyncStream) = process_messages(r_stream, w_stream, nothing)
-process_messages(r_stream::AsyncStream, w_stream::AsyncStream, rr_ntfy_join) = @schedule message_handler_loop(r_stream, w_stream, rr_ntfy_join)
+process_messages(r_stream::AsyncStream, w_stream::AsyncStream) = @schedule message_handler_loop(r_stream, w_stream)
 
-function message_handler_loop(r_stream::AsyncStream, w_stream::AsyncStream, rr_ntfy_join)
-    global PGRP
-    global cluster_manager
-
+function message_handler_loop(r_stream::AsyncStream, w_stream::AsyncStream)
     try
         while true
             msg = deserialize(r_stream)
             #println("got msg: ",msg)
-            # handle message
-            if is(msg, :call)
-                id = deserialize(r_stream)
-                #print("$(myid()) got id $id\n")
-                f0 = deserialize(r_stream)
-                #print("$(myid()) got call $f0\n")
-                args0 = deserialize(r_stream)
-                #print("$(myid()) got args $args0\n")
-                let f=f0, args=args0
-                    schedule_call(id, ()->f(args...))
-                end
-            elseif is(msg, :call_fetch)
-                id = deserialize(r_stream)
-                f = deserialize(r_stream)
-                args = deserialize(r_stream)
-                let f=f, args=args, id=id, msg=msg
-                    @schedule begin
-                        v = run_work_thunk(()->f(args...))
-                        deliver_result(w_stream, msg, id, v)
-                        v
-                    end
-                end
-            elseif is(msg, :call_wait)
-                id = deserialize(r_stream)
-                notify_id = deserialize(r_stream)
-                f = deserialize(r_stream)
-                args = deserialize(r_stream)
-                let f=f, args=args, id=id, msg=msg, notify_id=notify_id
-                    @schedule begin
-                        rv = schedule_call(id, ()->f(args...))
-                        deliver_result(w_stream, msg, notify_id, wait(rv.channel))
-                    end
-                end
-            elseif is(msg, :do)
-                f = deserialize(r_stream)
-                args = deserialize(r_stream)
-                #print("got args: $args\n")
-                let f=f, args=args
-                    @schedule begin
-                        run_work_thunk(()->f(args...))
-                    end
-                end
-            elseif is(msg, :result)
-                # used to deliver result of wait or fetch
-                oid = deserialize(r_stream)
-                #print("$(myid()) got $msg $oid\n")
-                val = deserialize(r_stream)
-                put!(lookup_ref(oid).channel, val)
-            elseif is(msg, :identify_socket)
-                otherid = deserialize(r_stream)
-                Worker(otherid, r_stream, w_stream, cluster_manager) # The constructor registers the worker
+            handle_msg(Val{msg}, r_stream, w_stream)
 
-            elseif is(msg, :join_pgrp)
-                self_pid = LPROC.id = deserialize(r_stream)
-                locs = deserialize(r_stream)
-                self_is_local = deserialize(r_stream)
-                controller = Worker(1, r_stream, w_stream, cluster_manager)
-                register_worker(LPROC)
-
-                wait_tasks = Task[]
-
-                for (connect_at, rpid, r_is_local) in locs
-                    wconfig = WorkerConfig()
-                    wconfig.connect_at = connect_at
-                    wconfig.environ = AnyDict(:self_is_local=>self_is_local, :r_is_local=>r_is_local)
-
-                    let rpid=rpid, wconfig=wconfig
-                        t = @async connect_to_peer(cluster_manager, rpid, wconfig)
-                        push!(wait_tasks, t)
-                    end
-                end
-
-                for wt in wait_tasks; wait(wt); end
-
-                send_msg_now(controller, :join_complete, Sys.CPU_CORES, getpid())
-
-            elseif is(msg, :join_complete)
-                w = map_sock_wrkr[r_stream]
-
-                environ = get(w.config.environ, Dict())
-                environ[:cpu_cores] = deserialize(r_stream)
-                w.config.environ = environ
-
-                w.config.ospid = deserialize(r_stream)
-
-                put!(rr_ntfy_join, w.id)
-                rr_ntfy_join = nothing    # so that it gets gc'ed
-            end
-
-        end # end of while
+        end
     catch e
         iderr = worker_id_from_socket(r_stream)
         werr = worker_from_id(iderr)
         oldstate = werr.state
         set_worker_state(werr, W_TERMINATED)
-
 
         # If error occured talking to pid 1, commit harakiri
         if iderr == 1
@@ -908,6 +815,97 @@ function message_handler_loop(r_stream::AsyncStream, w_stream::AsyncStream, rr_n
 
         return nothing
     end
+end
+
+function handle_msg(::Type{Val{:call}}, r_stream, w_stream)
+    id = deserialize(r_stream)
+    f0 = deserialize(r_stream)
+    args0 = deserialize(r_stream)
+    let f=f0, args=args0
+        schedule_call(id, ()->f(args...))
+    end
+end
+
+function handle_msg(::Type{Val{:call_fetch}}, r_stream, w_stream)
+    id = deserialize(r_stream)
+    f = deserialize(r_stream)
+    args = deserialize(r_stream)
+    @schedule begin
+        v = run_work_thunk(()->f(args...))
+        deliver_result(w_stream, :call_fetch, id, v)
+        v
+    end
+end
+
+function handle_msg(::Type{Val{:call_wait}}, r_stream, w_stream)
+    id = deserialize(r_stream)
+    notify_id = deserialize(r_stream)
+    f = deserialize(r_stream)
+    args = deserialize(r_stream)
+    @schedule begin
+        rv = schedule_call(id, ()->f(args...))
+        deliver_result(w_stream, :call_wait, notify_id, wait(rv.channel))
+    end
+end
+
+function handle_msg(::Type{Val{:do}}, r_stream, w_stream)
+    f = deserialize(r_stream)
+    args = deserialize(r_stream)
+    @schedule begin
+        run_work_thunk(()->f(args...))
+    end
+end
+
+function handle_msg(::Type{Val{:result}}, r_stream, w_stream)
+    # used to deliver result of wait or fetch
+    oid = deserialize(r_stream)
+    val = deserialize(r_stream)
+    put!(lookup_ref(oid).channel, val)
+end
+
+function handle_msg(::Type{Val{:identify_socket}}, r_stream, w_stream)
+    otherid = deserialize(r_stream)
+    Worker(otherid, r_stream, w_stream, cluster_manager) # The constructor registers the worker
+end
+
+function handle_msg(::Type{Val{:join_pgrp}}, r_stream, w_stream)
+    self_pid = LPROC.id = deserialize(r_stream)
+    locs = deserialize(r_stream)
+    self_is_local = deserialize(r_stream)
+    ntfy_oid = deserialize(r_stream)
+    controller = Worker(1, r_stream, w_stream, cluster_manager)
+    register_worker(LPROC)
+
+    wait_tasks = Task[]
+
+    for (connect_at, rpid, r_is_local) in locs
+        wconfig = WorkerConfig()
+        wconfig.connect_at = connect_at
+        wconfig.environ = AnyDict(:self_is_local=>self_is_local, :r_is_local=>r_is_local)
+
+        let rpid=rpid, wconfig=wconfig
+            t = @async connect_to_peer(cluster_manager, rpid, wconfig)
+            push!(wait_tasks, t)
+        end
+    end
+
+    for wt in wait_tasks; wait(wt); end
+
+    send_msg_now(controller, :join_complete, Sys.CPU_CORES, getpid(), ntfy_oid)
+end
+
+function handle_msg(::Type{Val{:join_complete}}, r_stream, w_stream)
+    w = map_sock_wrkr[r_stream]
+
+    environ = get(w.config.environ, Dict())
+    environ[:cpu_cores] = deserialize(r_stream)
+    w.config.environ = environ
+
+    w.config.ospid = deserialize(r_stream)
+    ntfy_oid = deserialize(r_stream)
+
+    ntfy_channel = lookup_ref(ntfy_oid).channel
+    put!(ntfy_channel, w.id)
 end
 
 function connect_to_peer(manager::ClusterManager, rpid::Int, wconfig::WorkerConfig)
@@ -1169,11 +1167,14 @@ function create_worker(manager, wconfig)
     finalizer(w, (w)->if myid() == 1 manage(w.manager, w.id, w.config, :finalize) end)
 
     # set when the new worker has finshed connections with all other workers
-    rr_ntfy_join = RemoteRef()
+    ntfy_oid = next_rrid_tuple()
+    rr_ntfy_join = lookup_ref(ntfy_oid)
+    rr_ntfy_join.waitingfor = myid()
+
 
     # Start a new task to handle inbound messages from connected worker in master.
     # Also calls `wait_connected` on TCP streams.
-    process_messages(w.r_stream, w.w_stream, rr_ntfy_join)
+    process_messages(w.r_stream, w.w_stream)
 
     # send address information of all workers to the new worker.
     # Cluster managers set the address of each worker in `WorkerConfig.connect_at`.
@@ -1202,10 +1203,12 @@ function create_worker(manager, wconfig)
     join_list = filter(x -> (x.id != 1) && (x.id < w.id) && (x.state==W_CONNECTED), PGRP.workers)
 
     all_locs = map(x -> isa(x, Worker) ? (get(x.config.connect_at, ()), x.id, isa(x.manager, LocalManager)) : ((), x.id, true), join_list)
-    send_msg_now(w, :join_pgrp, w.id, all_locs, isa(w.manager, LocalManager))
+    send_msg_now(w, :join_pgrp, w.id, all_locs, isa(w.manager, LocalManager), ntfy_oid)
 
     @schedule manage(w.manager, w.id, w.config, :register)
-    wait(rr_ntfy_join)
+    take!(rr_ntfy_join.channel)
+    delete!(PGRP.refs, ntfy_oid)
+
     w.id
 end
 
